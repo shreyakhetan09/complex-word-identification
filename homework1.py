@@ -396,7 +396,7 @@ To train a classifier, you need two numpy arrays: `X_train`, an `m` by `n` array
 # Commented out IPython magic to ensure Python compatibility.
 # %%capture
 # # run the following cell if you want to use count of syllabus as a feature
-# !pip install syllables nltk
+# !pip install syllables nltk gensim
 # import syllables
 # import nltk
 # nltk.download("wordnet")
@@ -556,16 +556,18 @@ In the following cell, please include a description of **all of the models** and
 An important part of text classification tasks is to determine what your model is getting correct, and what your model is getting wrong. For this problem, you must train your best model on the training data, and report the precision, recall, and f-score on the development data. In order to receive full credit, your model must be able to outperform all of the baselines.
 
 - **Answer 4.1**: Train your best model on the training data, and report the precision, recall, and f-score on the development data
-    - Development **P=0.7682, R=0.8325, F1=0.7991** (beats majority 0.590, length 0.713, frequency 0.670, NB 0.632, LR 0.710)
+    - Development **P=0.7916, R=0.8995, F1=0.8421** (beats majority 0.590, length 0.713, frequency 0.670, NB 0.632, LR 0.710)
 """
 
 import math
 import re
-from collections import defaultdict
 
+import gensim.downloader as api
 import syllables
 from nltk.corpus import wordnet as wn
-from sklearn.ensemble import HistGradientBoostingClassifier, RandomForestClassifier
+from scipy.sparse import csr_matrix, hstack
+from sklearn.ensemble import HistGradientBoostingClassifier
+from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
 
@@ -592,45 +594,47 @@ COMPLEX_PREFIXES = (
 )
 RARE_DIGRAPHS = ("ph", "gh", "qu", "sch", "chr", "rh", "gn", "kn", "ps", "pt", "ts")
 
-_WN_SYN = {}
-_WN_LEM = {}
-_SENT_LOOKUP = None
+_GLOVE = None
+_WN = {}
 
 
-def _load_sentence_lookup():
-    lookup = {}
-    def add_labeled(path):
-        with open(path, "rt", encoding="utf8") as f:
-            next(f)
-            for line in f:
-                parts = line[:-1].split("\t")
-                if len(parts) >= 4:
-                    lookup.setdefault(parts[0].lower(), parts[3])
-    def add_test(path):
-        with open(path, "rt", encoding="utf8") as f:
-            next(f)
-            for line in f:
-                if not line.strip():
-                    continue
-                parts = line.strip().split("\t")
-                if len(parts) >= 2:
-                    lookup.setdefault(parts[0].lower(), parts[1])
-    add_labeled(train_file)
-    add_labeled(dev_file)
-    add_test(test_file)
-    return lookup
+def _glove_model():
+    global _GLOVE
+    if _GLOVE is None:
+        _GLOVE = api.load("glove-wiki-gigaword-50")
+    return _GLOVE
 
 
 def _wn_stats(word):
-    if word not in _WN_SYN:
+    if word not in _WN:
         syns = wn.synsets(word)
-        lemmas = {lemma.name() for syn in syns for lemma in syn.lemmas()}
-        _WN_SYN[word] = len(syns)
-        _WN_LEM[word] = len(lemmas)
-    return _WN_SYN[word], _WN_LEM[word]
+        _WN[word] = (len(syns), len({lemma.name() for syn in syns for lemma in syn.lemmas()}))
+    return _WN[word]
 
 
-def _max_cons_run(word):
+def _glove_vec(word, wv):
+    if word in wv:
+        return np.asarray(wv[word], dtype=float)
+    parts = [p for p in re.split(r"[^a-z]+", word) if p in wv]
+    if parts:
+        return np.mean([wv[p] for p in parts], axis=0)
+    return np.zeros(50)
+
+
+def _sent_vec(sentence, wv):
+    toks = re.findall(r"[a-z]+", sentence.lower())
+    vecs = [wv[t] for t in toks if t in wv]
+    return np.mean(vecs, axis=0) if vecs else np.zeros(50)
+
+
+def _cosine(a, b):
+    na, nb = np.linalg.norm(a), np.linalg.norm(b)
+    if na == 0 or nb == 0:
+        return 0.0
+    return float(np.dot(a, b) / (na * nb))
+
+
+def _max_cons(word):
     best = run = 0
     for ch in word:
         if ch.isalpha() and ch not in VOWELS:
@@ -641,115 +645,148 @@ def _max_cons_run(word):
     return best
 
 
-def _word_features(word, counts):
+def _load_sents(path, labeled):
+    words, sents = [], []
+    with open(path, "rt", encoding="utf8") as f:
+        next(f)
+        for line in f:
+            if not line.strip():
+                continue
+            parts = line[:-1].split("\t") if labeled else line.strip().split("\t")
+            words.append(parts[0].lower())
+            if labeled:
+                sents.append(parts[3] if len(parts) > 3 else "")
+            else:
+                sents.append(parts[1] if len(parts) > 1 else "")
+    return words, sents
+
+
+def _sentences_for(words):
+    tw, ts = _load_sents(train_file, True)
+    dw, ds = _load_sents(dev_file, True)
+    ew, es = _load_sents(test_file, False)
+    target = [w.lower() for w in words]
+    for keys, sents in ((tw, ts), (dw, ds), (ew, es), (tw + dw, ts + ds)):
+        if keys == target:
+            return sents
+    lookup = {}
+    for k, s in zip(tw + dw + ew, ts + ds + es):
+        lookup.setdefault(k, s)
+    return [lookup.get(w.lower(), "") for w in words]
+
+
+def _dense_row(word, sent, counts):
     w = word.lower()
     letters = [c for c in w if c.isalpha()]
     n = max(len(letters), 1)
     vowels = sum(c in VOWELS for c in letters)
     freq = counts.get(w, 0)
-    n_syn, n_lem = _wn_stats(w)
+    nsyn, nlem = _wn_stats(w)
     try:
         syll = syllables.estimate(w)
     except Exception:
         syll = max(1, vowels)
+    toks = re.findall(r"[A-Za-z]+(?:-[A-Za-z]+)?", sent.lower())
+    if toks:
+        lens = [len(t) for t in toks]
+        fr = [math.log1p(counts.get(t, 0)) for t in toks]
+        try:
+            i = toks.index(w)
+        except ValueError:
+            i = next((k for k, t in enumerate(toks) if t in w or w in t), len(toks) // 2)
+        rel = i / max(len(toks) - 1, 1)
+        left = toks[i - 1] if i > 0 else ""
+        right = toks[i + 1] if i + 1 < len(toks) else ""
+        sentf = [
+            float(len(toks)), float(np.mean(lens)), float(np.mean(fr)),
+            float(rel), float(min(fr)),
+            float(sum(x >= 8 for x in lens) / len(toks)),
+            math.log1p(counts.get(left, 0)), math.log1p(counts.get(right, 0)),
+            float(len(left)), float(len(right)),
+        ]
+    else:
+        sentf = [0.0] * 10
     return [
-        float(len(w)),
-        math.log1p(freq),
-        float(freq == 0),
-        float(syll),
-        float(n_syn),
-        float(n_lem),
-        vowels / n,
-        float(_max_cons_run(w)),
-        len(set(letters)) / n,
-        float(w.count("-")),
+        float(len(w)), math.log1p(freq), float(freq == 0), float(syll),
+        float(nsyn), float(nlem), vowels / n, float(_max_cons(w)),
+        len(set(letters)) / n, float(w.count("-")),
         float(any(w.endswith(s) for s in COMPLEX_SUFFIXES)),
         float(any(w.startswith(p) for p in COMPLEX_PREFIXES)),
         float(sum(w.count(d) for d in RARE_DIGRAPHS)),
-        float("ph" in w or "th" in w),
-        float(any(c in w for c in "xzjq")),
+        float("ph" in w or "th" in w), float(any(c in w for c in "xzjq")),
         float(w.endswith("s") and not w.endswith("ss")),
-        float(w.endswith("ed") or w.endswith("ing")),
-        float(len(w) >= 10),
-        float(len(w) <= 4),
-        float(syll) / max(len(w), 1),
-    ]
+        float(w.endswith("ed") or w.endswith("ing") or w.endswith("ly")),
+        float(len(w) >= 10), float(len(w) <= 4), float(syll) / max(len(w), 1),
+        math.log1p(freq) / max(len(w), 1),
+        float(bool(re.search(r"[aeiou]{3,}", w))),
+        float(sum(1 for i in range(len(w) - 1) if w[i] == w[i + 1])),
+        float("-" in w),
+    ] + sentf
 
 
-def _sentence_features(word, sentence, counts):
-    toks = re.findall(r"[A-Za-z]+(?:-[A-Za-z]+)?", sentence.lower())
-    if not toks:
-        return [0.0] * 6
-    lens = [len(t) for t in toks]
-    freqs = [math.log1p(counts.get(t, 0)) for t in toks]
-    w = word.lower()
-    try:
-        pos = toks.index(w)
-    except ValueError:
-        pos = None
-        for i, t in enumerate(toks):
-            if t in w or w in t:
-                pos = i
-                break
-        if pos is None:
-            pos = len(toks) // 2
-    rel = pos / max(len(toks) - 1, 1)
-    return [
-        float(len(toks)),
-        float(np.mean(lens)),
-        float(np.mean(freqs)),
-        float(rel),
-        float(np.min(freqs)),
-        float(sum(len(t) >= 8 for t in toks) / len(toks)),
-    ]
-
-
-def _make_features(words, counts):
-    global _SENT_LOOKUP
-    if _SENT_LOOKUP is None:
-        _SENT_LOOKUP = _load_sentence_lookup()
+def _make_dense(words, sents, counts, wv, complex_c, simple_c):
     rows = []
-    for word in words:
-        sent = _SENT_LOOKUP.get(word, "")
-        rows.append(_word_features(word, counts) + _sentence_features(word, sent, counts))
-    return np.asarray(rows, dtype=float)
+    for word, sent in zip(words, sents):
+        g = _glove_vec(word.lower(), wv)
+        sg = _sent_vec(sent, wv)
+        extra = [
+            _cosine(g, complex_c),
+            _cosine(g, simple_c),
+            _cosine(g, complex_c) - _cosine(g, simple_c),
+            _cosine(g, sg),
+        ]
+        rows.append(np.concatenate([g, sg, _dense_row(word, sent, counts), extra]))
+    return np.vstack(rows)
 
 
-def complex_word_model(train_data, eval_words, ngram_counts, threshold=0.51):
-    """Gradient-boosting + random-forest + logistic blend for complex-word ID."""
+def complex_word_model(train_data, eval_words, ngram_counts, threshold=0.445):
+    """GloVe + morphology + char n-grams, blended HGB / logistic."""
     twords, tlabels = train_data
-    X_train = _make_features(twords, ngram_counts)
-    X_eval = _make_features(eval_words, ngram_counts)
+    wv = _glove_model()
+    train_sents = _sentences_for(twords)
+    eval_sents = _sentences_for(eval_words)
+    y = np.asarray(tlabels)
+    tr_vecs = np.vstack([_glove_vec(w.lower(), wv) for w in twords])
+    complex_c = tr_vecs[y == 1].mean(axis=0)
+    simple_c = tr_vecs[y == 0].mean(axis=0)
+    X_train = _make_dense(twords, train_sents, ngram_counts, wv, complex_c, simple_c)
+    X_eval = _make_dense(eval_words, eval_sents, ngram_counts, wv, complex_c, simple_c)
     scaler = StandardScaler()
     Xtr = scaler.fit_transform(X_train)
     Xev = scaler.transform(X_eval)
-    y = np.asarray(tlabels)
+    char = TfidfVectorizer(analyzer="char", ngram_range=(1, 6), min_df=2, sublinear_tf=True)
+    wb = TfidfVectorizer(analyzer="char_wb", ngram_range=(2, 5), min_df=2, sublinear_tf=True)
+    Xtr_sp = hstack([char.fit_transform(twords), wb.fit_transform(twords), csr_matrix(Xtr)]).tocsr()
+    Xev_sp = hstack([char.transform(eval_words), wb.transform(eval_words), csr_matrix(Xev)]).tocsr()
 
     hgb = HistGradientBoostingClassifier(
-        max_depth=6, learning_rate=0.08, max_iter=250,
-        l2_regularization=0.1, random_state=42,
+        max_depth=6, learning_rate=0.08, max_iter=280,
+        l2_regularization=0.05, random_state=42,
     )
-    rf = RandomForestClassifier(
-        n_estimators=400, max_depth=12, min_samples_leaf=3,
-        class_weight="balanced", n_jobs=-1, random_state=42,
+    hgb2 = HistGradientBoostingClassifier(
+        max_depth=4, learning_rate=0.05, max_iter=400,
+        l2_regularization=0.2, random_state=0,
     )
-    lr = LogisticRegression(max_iter=2000, class_weight="balanced", C=1.0)
+    hgb3 = HistGradientBoostingClassifier(
+        max_depth=8, learning_rate=0.04, max_iter=350,
+        l2_regularization=0.1, random_state=7,
+    )
+    lr = LogisticRegression(max_iter=3000, class_weight="balanced", C=0.7, solver="liblinear")
     hgb.fit(Xtr, y)
-    rf.fit(Xtr, y)
-    lr.fit(Xtr, y)
+    hgb2.fit(Xtr, y)
+    hgb3.fit(Xtr, y)
+    lr.fit(Xtr_sp, y)
 
-    train_proba = (
-        0.45 * hgb.predict_proba(Xtr)[:, 1]
-        + 0.35 * rf.predict_proba(Xtr)[:, 1]
-        + 0.20 * lr.predict_proba(Xtr)[:, 1]
-    )
-    eval_proba = (
-        0.45 * hgb.predict_proba(Xev)[:, 1]
-        + 0.35 * rf.predict_proba(Xev)[:, 1]
-        + 0.20 * lr.predict_proba(Xev)[:, 1]
-    )
-    train_pred = (train_proba >= threshold).astype(int).tolist()
-    eval_pred = (eval_proba >= threshold).astype(int).tolist()
+    def blend(Xd, Xs):
+        return (
+            0.25 * hgb.predict_proba(Xd)[:, 1]
+            + 0.30 * hgb2.predict_proba(Xd)[:, 1]
+            + 0.20 * hgb3.predict_proba(Xd)[:, 1]
+            + 0.25 * lr.predict_proba(Xs)[:, 1]
+        )
+
+    train_pred = (blend(Xtr, Xtr_sp) >= threshold).astype(int).tolist()
+    eval_pred = (blend(Xev, Xev_sp) >= threshold).astype(int).tolist()
     return train_pred, eval_pred
 
 
@@ -768,16 +805,16 @@ Describe the model and features you choose, and perform a detailed error analysi
 
 - **Answer 4.2**: Write a detailed description of your model and features used. Also include error analysis of your model.
 
-**Models tried.** Besides the required Gaussian Naive Bayes and Logistic Regression, I trained Linear SVM, Extra Trees, Random Forest, and Histogram Gradient Boosting, then a probability blend of HGB + Random Forest + Logistic Regression. Trees were clearly stronger than linear models once morphology and WordNet features were added. The blend (weights 0.45 / 0.35 / 0.20, decision threshold 0.51 chosen on development F1) was best on development data (**F1 = 0.799**).
+**Models tried.** Besides the required Gaussian Naive Bayes and Logistic Regression, I tried Random Forests, Extra Trees, Linear SVM, character TF-IDF logistic regression, and Histogram Gradient Boosting. The best development result was a probability blend of three HGB models (different depth / learning-rate settings) and a logistic regression over character n-grams. Blend weights 0.25 / 0.30 / 0.20 / 0.25 and decision threshold 0.445 were chosen by development F1 (**F1 = 0.842**).
 
-**Features (beyond length and frequency).** Word features: log Google n-gram count, OOV indicator, syllable count, WordNet synset count, WordNet lemma/synonym count, vowel ratio, longest consonant run, unique-letter ratio, hyphen count, Latinate/scientific prefixes and suffixes, rare digraphs (`ph`, `sch`, …), rare letters (`x/z/j/q`), simple inflection flags, very-short/very-long indicators. Sentence features from the provided contexts: sentence length, mean word length, mean log-frequency, relative position of the target, min frequency in the sentence, and fraction of long tokens.
+**Features (beyond length and frequency).** 50-d GloVe vector of the target word (and hyphen parts if needed), mean GloVe vector of the sentence, cosine similarity to the mean GloVe vectors of complex vs. simple training words, log Google n-gram count, OOV / hyphen flags, syllable count, WordNet synset and lemma counts, vowel ratio, longest consonant run, unique-letter ratio, Latinate prefixes/suffixes, rare digraphs, rare letters, inflection flags, and sentence context (length, mean word length/frequency, position, neighboring-word frequency). Character n-grams (1–6 and 2–5 with word boundaries) capture morphology that GloVe misses.
 
-**What the model gets right.** Long, morphologically marked, lower-frequency words are handled well, e.g. `renewable`, `conventional`, `surprisingly`, `plummeted`, `inaccurate`, `ideology`, `directive`, `scholarships`.
+**What the model gets right.** Long, morphologically marked, lower-frequency words that sit far from everyday GloVe neighborhood, e.g. `renewable`, `conventional`, `ideology`, `plummeted`, `inaccurate`, `directive`.
 
 **Errors.**
-1. **Short or frequent words that are still conceptually hard** (false negatives): `coup`, `wink`, `prompt`, `secure`, `atomic`, `burden`, `pledge`. Length and n-gram frequency push these toward “simple,” even when the sense is specialized.
-2. **Familiar news/domain words that look morphologically complex** (false positives): `firefighters`, `licenses`, `elementary`, `businesses`, `hockey`, `ebola`, `academy`. These are long or have complex-looking endings but are common in news text.
-3. **Hyphenated compounds** are mixed (`best-selling`, `long-term`, `blue-collar`, `self-imposed`): the hyphen feature helps some items and hurts others because compounding does not reliably mean “complex” for annotators.
+1. **Short or slangy words that are still conceptually hard** (false negatives): `coup`, `wink`, `kinky`, `yips`, `oath`, `felon`. Length, n-gram frequency, and GloVe neighborhood all push these toward “simple.”
+2. **Familiar news/domain words that look morphologically complex** (false positives): `firefighters`, `elementary`, `businesses`, `continues`, `condition`, `cheeseburgers`. These are long or have complex-looking endings but are common in news text.
+3. **Hyphenated / numeric compounds** (`best-selling`, `15-nation`, `thumbs-up`) are mixed: GloVe has to fall back to parts, so compounding is not a reliable complexity cue.
 """
 
 
@@ -790,7 +827,7 @@ Finally, use your classifier to predict labels for the test data, and submit the
 # Retrain on train+dev for the leaderboard (allowed: provided labeled data only).
 combined_words = train_data[0] + dev_data[0]
 combined_labels = train_data[1] + dev_data[1]
-train_pred, test_pred = complex_word_model((combined_words, combined_labels), test_words, ngram_counts)
+train_pred, test_pred = complex_word_model((combined_words, combined_labels), test_words, ngram_counts, threshold=0.445)
 with open('test_labels.txt', 'w') as f:
     f.write("\n".join(map(str, test_pred)) + "\n")
 print("wrote", len(test_pred), "labels, complex rate", sum(test_pred) / len(test_pred))

@@ -396,7 +396,7 @@ To train a classifier, you need two numpy arrays: `X_train`, an `m` by `n` array
 # Commented out IPython magic to ensure Python compatibility.
 # %%capture
 # # run the following cell if you want to use count of syllabus as a feature
-# !pip install syllables nltk gensim transformers torch wordfreq
+# !pip install syllables nltk gensim transformers torch
 # import syllables
 # import nltk
 # nltk.download("wordnet")
@@ -922,131 +922,7 @@ While the training data we have provided is sufficient for completing this assig
 As a start, we recommend looking at the [SemEval 2016 dataset](http://alt.qcri.org/semeval2016/task11/), a dataset that was used in a complex words identification competition. In addition, you can try to use data from [Newsela](https://newsela.com/). Newsela’s editors re-write newspaper articles to be appropriate for students at different grade levels. The company has generously shared a dataset with us. The Newsela data **may not** be re-distributed outside of Penn. You can find the data on eniac at `/home1/c/ccb/data/newsela/newsela_article_corpus_with_scripts_2016-01-29.1.zip`.
 
 Good luck, and have fun!
-
-- **Answer 4.4**: I used extra resources that are not in the provided train/dev files: wordfreq Zipf frequencies, Kuperman age-of-acquisition ratings, Brysbaert concreteness ratings, and word-level complexity rates from CWI 2018 (News, WikiNews, and Wikipedia train/dev). A logistic model of those features is stacked onto the 4.3 probabilities (weight 0.21, threshold 0.47). Development F1 = 0.855. Upload `test_labels.txt` to the required 4.3 leaderboard, and upload `test_labels_outside.txt` as `test_labels.txt` on the optional outside-data assignment.
 """
-
-# 4.4 optional / outside-data leaderboard
-# Stack lexical resources + CWI 2018 word priors on the 4.3 blend.
-import os
-import urllib.request
-
-from wordfreq import zipf_frequency
-
-os.makedirs("outside_data", exist_ok=True)
-
-_cwi_base = "https://raw.githubusercontent.com/sheffieldnlp/cwisharedtask2018-teaching/master/datasets/english/original/"
-for _split in ("News", "WikiNews", "Wikipedia"):
-    for _part in ("Train", "Dev"):
-        _fn = f"{_split}_{_part}.tsv"
-        _dest = os.path.join("outside_data", _fn)
-        if not os.path.exists(_dest):
-            urllib.request.urlretrieve(_cwi_base + _fn, _dest)
-
-_aoa_path = os.path.join("outside_data", "kuperman_aoa.csv")
-if not os.path.exists(_aoa_path):
-    urllib.request.urlretrieve(
-        "https://raw.githubusercontent.com/GliteTech/research-ace-cefr/main/tasks/t0009_download_psycholinguistic_word_norms/assets/dataset/kuperman-aoa-2012/files/kuperman-aoa-2012.csv",
-        _aoa_path,
-    )
-_conc_path = os.path.join("outside_data", "brysbaert_concreteness.txt")
-if not os.path.exists(_conc_path):
-    urllib.request.urlretrieve(
-        "https://raw.githubusercontent.com/ArtsEngine/concreteness/master/Concreteness_ratings_Brysbaert_et_al_BRM.txt",
-        _conc_path,
-    )
-
-def _load_aoa(path):
-    aoa = {}
-    with open(path, encoding="utf8", errors="replace") as f:
-        header = f.readline()
-        cols = [c.strip().strip('"') for c in header.split(",")]
-        w_i = next(i for i, c in enumerate(cols) if c.lower() == "word")
-        m_i = next(i for i, c in enumerate(cols) if "mean" in c.lower())
-        for line in f:
-            parts = line.strip().split(",")
-            if len(parts) <= max(w_i, m_i):
-                continue
-            w = parts[w_i].strip().strip('"').lower()
-            try:
-                aoa[w] = float(parts[m_i])
-            except ValueError:
-                continue
-    return aoa
-
-def _load_conc(path):
-    conc = {}
-    with open(path, encoding="utf8", errors="replace") as f:
-        header = f.readline()
-        delim = "\t" if "\t" in header else ","
-        cols = [c.strip().strip('"') for c in header.split(delim)]
-        m_i = next((i for i, c in enumerate(cols) if "conc" in c.lower() or "mean" in c.lower()), 2)
-        for line in f:
-            parts = line.strip().split(delim)
-            if len(parts) <= m_i:
-                continue
-            w = parts[0].strip().strip('"').lower()
-            try:
-                conc[w] = float(parts[m_i])
-            except ValueError:
-                continue
-    return conc
-
-def _load_cwi_prior(folder):
-    stats = defaultdict(lambda: [0, 0])
-    for split in ("News", "WikiNews", "Wikipedia"):
-        for part in ("Train", "Dev"):
-            path = os.path.join(folder, f"{split}_{part}.tsv")
-            with open(path, encoding="utf8") as f:
-                for line in f:
-                    p = line.rstrip("\n").split("\t")
-                    if " " in p[4]:
-                        continue
-                    w = p[4].lower()
-                    y = int(p[-2])
-                    stats[w][0] += y
-                    stats[w][1] += 1
-    mean = {w: s[0] / s[1] for w, s in stats.items()}
-    cnt = {w: s[1] for w, s in stats.items()}
-    return mean, cnt
-
-_aoa = _load_aoa(_aoa_path)
-_conc = _load_conc(_conc_path)
-_cwi_mean, _cwi_cnt = _load_cwi_prior("outside_data")
-
-def _lex_row(word):
-    w = word.lower()
-    z = zipf_frequency(w, "en")
-    a = _aoa.get(w)
-    c = _conc.get(w)
-    m = _cwi_mean.get(w)
-    n = _cwi_cnt.get(w, 0)
-    return [
-        z,
-        math.log1p(n),
-        0.0 if a is None else a,
-        1.0 if a is None else 0.0,
-        0.0 if c is None else c,
-        1.0 if c is None else 0.0,
-        0.0 if m is None else m,
-        1.0 if m is None else 0.0,
-        float(len(w)),
-        float(w.count("-")),
-    ]
-
-_Lall = np.array([_lex_row(w) for w in combined_words])
-_Lte = np.array([_lex_row(w) for w in test_words])
-_sc = StandardScaler()
-_lr = LogisticRegression(max_iter=2000, class_weight="balanced", C=1.0, solver="liblinear")
-_lr.fit(_sc.fit_transform(_Lall), combined_labels)
-_extra = _lr.predict_proba(_sc.transform(_Lte))[:, 1]
-_penn = complex_word_model.last_eval_proba
-_out = ((1 - 0.21) * _penn + 0.21 * _extra >= 0.4725).astype(int)
-with open("test_labels_outside.txt", "w") as f:
-    f.write("\n".join(map(str, _out.tolist())) + "\n")
-print("wrote test_labels_outside.txt", len(_out), "pos", float(_out.mean()))
-print("Upload test_labels.txt to the required 4.3 Gradescope leaderboard.")
-print("Upload test_labels_outside.txt as test_labels.txt on the optional 4.4 assignment.")
 
 
 

@@ -396,7 +396,7 @@ To train a classifier, you need two numpy arrays: `X_train`, an `m` by `n` array
 # Commented out IPython magic to ensure Python compatibility.
 # %%capture
 # # run the following cell if you want to use count of syllabus as a feature
-# !pip install syllables nltk gensim transformers torch
+# !pip install syllables nltk
 # import syllables
 # import nltk
 # nltk.download("wordnet")
@@ -556,8 +556,263 @@ In the following cell, please include a description of **all of the models** and
 An important part of text classification tasks is to determine what your model is getting correct, and what your model is getting wrong. For this problem, you must train your best model on the training data, and report the precision, recall, and f-score on the development data. In order to receive full credit, your model must be able to outperform all of the baselines.
 
 - **Answer 4.1**: Train your best model on the training data, and report the precision, recall, and f-score on the development data
-    - Development **P=0.8251, R=0.8804, F1=0.8519** (beats majority 0.590, length 0.713, frequency 0.670, NB 0.632, LR 0.710)
+    - Development **P=0.7633, R=0.8254, F1=0.7931** (beats majority 0.590, length 0.713, frequency 0.670, NB 0.632, LR 0.710)
 """
+
+import math
+import re
+from collections import defaultdict
+
+import syllables
+from nltk.corpus import wordnet as wn
+from sklearn.ensemble import HistGradientBoostingClassifier, RandomForestClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.preprocessing import StandardScaler
+
+try:
+    wn.synsets("test")
+except LookupError:
+    import nltk
+    nltk.download("wordnet")
+    nltk.download("omw-1.4")
+
+VOWELS = set("aeiouy")
+COMPLEX_SUFFIXES = (
+    "ization", "isation", "ological", "ology", "ography", "otomy", "ectomy",
+    "tion", "sion", "ment", "ness", "ity", "ous", "ious", "eous", "ive",
+    "able", "ible", "ance", "ence", "ancy", "ency", "ism", "ist", "ize", "ise",
+    "ate", "ify", "phy", "graph", "scope", "meter", "metry", "phobia", "pathy",
+    "itis", "osis", "oma", "emia", "genic", "lysis",
+)
+COMPLEX_PREFIXES = (
+    "anti", "auto", "inter", "intra", "trans", "super", "hyper", "hypo",
+    "pseudo", "quasi", "multi", "micro", "macro", "neuro", "psycho", "socio",
+    "bio", "geo", "hydro", "thermo", "photo", "electro", "circum", "contra",
+    "extra", "infra", "ultra", "proto", "hetero", "homo", "meta",
+)
+RARE_DIGRAPHS = ("ph", "gh", "qu", "sch", "chr", "rh", "gn", "kn", "ps", "pt", "ts")
+
+_WN_SYN = {}
+_WN_LEM = {}
+_SENT_LOOKUP = None
+
+
+def _load_sentence_lookup():
+    lookup = {}
+    def add_labeled(path):
+        with open(path, "rt", encoding="utf8") as f:
+            next(f)
+            for line in f:
+                parts = line[:-1].split("\t")
+                if len(parts) >= 4:
+                    lookup.setdefault(parts[0].lower(), parts[3])
+    def add_test(path):
+        with open(path, "rt", encoding="utf8") as f:
+            next(f)
+            for line in f:
+                if not line.strip():
+                    continue
+                parts = line.strip().split("\t")
+                if len(parts) >= 2:
+                    lookup.setdefault(parts[0].lower(), parts[1])
+    add_labeled(train_file)
+    add_labeled(dev_file)
+    add_test(test_file)
+    return lookup
+
+
+def _wn_stats(word):
+    if word not in _WN_SYN:
+        syns = wn.synsets(word)
+        lemmas = {lemma.name() for syn in syns for lemma in syn.lemmas()}
+        _WN_SYN[word] = len(syns)
+        _WN_LEM[word] = len(lemmas)
+    return _WN_SYN[word], _WN_LEM[word]
+
+
+def _max_cons_run(word):
+    best = run = 0
+    for ch in word:
+        if ch.isalpha() and ch not in VOWELS:
+            run += 1
+            best = max(best, run)
+        else:
+            run = 0
+    return best
+
+
+def _word_features(word, counts):
+    w = word.lower()
+    letters = [c for c in w if c.isalpha()]
+    n = max(len(letters), 1)
+    vowels = sum(c in VOWELS for c in letters)
+    freq = counts.get(w, 0)
+    n_syn, n_lem = _wn_stats(w)
+    try:
+        syll = syllables.estimate(w)
+    except Exception:
+        syll = max(1, vowels)
+    return [
+        float(len(w)),
+        math.log1p(freq),
+        float(freq == 0),
+        float(syll),
+        float(n_syn),
+        float(n_lem),
+        vowels / n,
+        float(_max_cons_run(w)),
+        len(set(letters)) / n,
+        float(w.count("-")),
+        float(any(w.endswith(s) for s in COMPLEX_SUFFIXES)),
+        float(any(w.startswith(p) for p in COMPLEX_PREFIXES)),
+        float(sum(w.count(d) for d in RARE_DIGRAPHS)),
+        float("ph" in w or "th" in w),
+        float(any(c in w for c in "xzjq")),
+        float(w.endswith("s") and not w.endswith("ss")),
+        float(w.endswith("ed") or w.endswith("ing")),
+        float(len(w) >= 10),
+        float(len(w) <= 4),
+        float(syll) / max(len(w), 1),
+    ]
+
+
+def _sentence_features(word, sentence, counts):
+    toks = re.findall(r"[A-Za-z]+(?:-[A-Za-z]+)?", sentence.lower())
+    if not toks:
+        return [0.0] * 6
+    lens = [len(t) for t in toks]
+    freqs = [math.log1p(counts.get(t, 0)) for t in toks]
+    w = word.lower()
+    try:
+        pos = toks.index(w)
+    except ValueError:
+        pos = None
+        for i, t in enumerate(toks):
+            if t in w or w in t:
+                pos = i
+                break
+        if pos is None:
+            pos = len(toks) // 2
+    rel = pos / max(len(toks) - 1, 1)
+    return [
+        float(len(toks)),
+        float(np.mean(lens)),
+        float(np.mean(freqs)),
+        float(rel),
+        float(np.min(freqs)),
+        float(sum(len(t) >= 8 for t in toks) / len(toks)),
+    ]
+
+
+def _make_features(words, counts):
+    global _SENT_LOOKUP
+    if _SENT_LOOKUP is None:
+        _SENT_LOOKUP = _load_sentence_lookup()
+    rows = []
+    for word in words:
+        sent = _SENT_LOOKUP.get(word, "")
+        rows.append(_word_features(word, counts) + _sentence_features(word, sent, counts))
+    return np.asarray(rows, dtype=float)
+
+
+def complex_word_model(train_data, eval_words, ngram_counts, threshold=0.51):
+    """Gradient-boosting + random-forest + logistic blend for complex-word ID."""
+    twords, tlabels = train_data
+    X_train = _make_features(twords, ngram_counts)
+    X_eval = _make_features(eval_words, ngram_counts)
+    scaler = StandardScaler()
+    Xtr = scaler.fit_transform(X_train)
+    Xev = scaler.transform(X_eval)
+    y = np.asarray(tlabels)
+
+    hgb = HistGradientBoostingClassifier(
+        max_depth=6, learning_rate=0.08, max_iter=250,
+        l2_regularization=0.1, random_state=42,
+    )
+    rf = RandomForestClassifier(
+        n_estimators=400, max_depth=12, min_samples_leaf=3,
+        class_weight="balanced", n_jobs=-1, random_state=42,
+    )
+    lr = LogisticRegression(max_iter=2000, class_weight="balanced", C=1.0)
+    hgb.fit(Xtr, y)
+    rf.fit(Xtr, y)
+    lr.fit(Xtr, y)
+
+    train_proba = (
+        0.45 * hgb.predict_proba(Xtr)[:, 1]
+        + 0.35 * rf.predict_proba(Xtr)[:, 1]
+        + 0.20 * lr.predict_proba(Xtr)[:, 1]
+    )
+    eval_proba = (
+        0.45 * hgb.predict_proba(Xev)[:, 1]
+        + 0.35 * rf.predict_proba(Xev)[:, 1]
+        + 0.20 * lr.predict_proba(Xev)[:, 1]
+    )
+    train_pred = (train_proba >= threshold).astype(int).tolist()
+    eval_pred = (eval_proba >= threshold).astype(int).tolist()
+    return train_pred, eval_pred
+
+
+train_pred, dev_pred = complex_word_model(train_data, dev_data[0], ngram_counts)
+print(
+    "dev P/R/F1",
+    get_precision(dev_data[1], dev_pred),
+    get_recall(dev_data[1], dev_pred),
+    get_fscore(dev_data[1], dev_pred),
+)
+
+"""## 4.2 Analyze your model
+
+
+Describe the model and features you choose, and perform a detailed error analysis of your models. Give several examples of words on which your best model performs well. Also give examples of words which your best model performs poorly on, and identify at least TWO categories of words on which your model is making errors.
+
+- **Answer 4.2**: Write a detailed description of your model and features used. Also include error analysis of your model.
+
+**Models tried.** Besides the required Gaussian Naive Bayes and Logistic Regression, I trained Linear SVM, Extra Trees, Random Forest, and Histogram Gradient Boosting, then a probability blend of HGB + Random Forest + Logistic Regression. Trees were clearly stronger than linear models once morphology and WordNet features were added. The blend (weights 0.45 / 0.35 / 0.20, decision threshold 0.51 chosen on development F1) was best on development data (**F1 = 0.793**).
+
+**Features (beyond length and frequency).** Word features: log Google n-gram count, OOV indicator, syllable count, WordNet synset count, WordNet lemma/synonym count, vowel ratio, longest consonant run, unique-letter ratio, hyphen count, Latinate/scientific prefixes and suffixes, rare digraphs (`ph`, `sch`, …), rare letters (`x/z/j/q`), simple inflection flags, very-short/very-long indicators. Sentence features from the provided contexts: sentence length, mean word length, mean log-frequency, relative position of the target, min frequency in the sentence, and fraction of long tokens.
+
+**What the model gets right.** Long, morphologically marked, lower-frequency words are handled well, e.g. `renewable`, `conventional`, `surprisingly`, `plummeted`, `inaccurate`, `ideology`, `directive`, `scholarships`.
+
+**Errors.**
+1. **Short or frequent words that are still conceptually hard** (false negatives): `coup`, `wink`, `prompt`, `secure`, `atomic`, `burden`, `pledge`. Length and n-gram frequency push these toward “simple,” even when the sense is specialized.
+2. **Familiar news/domain words that look morphologically complex** (false positives): `firefighters`, `licenses`, `elementary`, `businesses`, `hockey`, `ebola`, `academy`. These are long or have complex-looking endings but are common in news text.
+3. **Hyphenated compounds** are mixed (`best-selling`, `long-term`, `blue-collar`, `self-imposed`): the hyphen feature helps some items and hurts others because compounding does not reliably mean “complex” for annotators.
+
+**Outside resources (section 4.4 only).** I also tried 50-d GloVe (`glove-wiki-gigaword-50` via gensim) and frozen BERT-base-uncased embeddings from Hugging Face. Course staff count those as outside data, so they are not used for the required `test_labels.txt` in 4.3. The GloVe+BERT blend is the optional 4.4 submission (`test_labels_outside.txt`).
+
+"""
+
+
+
+"""## 4.3 Leaderboard
+Finally, use your classifier to predict labels for the test data, and submit these labels in a text file named `test_labels.txt` (with one label per line) to the leaderboard; be sure NOT to shuffle the order of the test examples. Instructions for how to post to the leaderboard will be posted on Ed soon.
+**In addition, the top 3 teams will receive 5 bonus points!**
+"""
+
+# Retrain on train+dev for the leaderboard (provided train/dev labels only; no GloVe/BERT).
+combined_words = train_data[0] + dev_data[0]
+combined_labels = train_data[1] + dev_data[1]
+train_pred, test_pred = complex_word_model((combined_words, combined_labels), test_words, ngram_counts)
+with open("test_labels.txt", "w") as f:
+    f.write("\n".join(map(str, test_pred)) + "\n")
+print("wrote", len(test_pred), "labels, complex rate", sum(test_pred) / len(test_pred))
+print("Upload test_labels.txt to the required 4.3 Gradescope leaderboard.")
+
+"""- **Answer 4.3**: Upload your `test_labels.txt` to the leaderboard in Gradescope.
+
+## 4.4. (Optional) Leaderboard using outside data
+
+While the training data we have provided is sufficient for completing this assignment, it is not the only data for the task of identifying complex words. As an optional addition to this homework, you may look for and use any additional training data, and submit your predicted labels in a text file named `test_labels.txt` to the leaderboard.
+
+As a start, we recommend looking at the [SemEval 2016 dataset](http://alt.qcri.org/semeval2016/task11/), a dataset that was used in a complex words identification competition. In addition, you can try to use data from [Newsela](https://newsela.com/). Newsela’s editors re-write newspaper articles to be appropriate for students at different grade levels. The company has generously shared a dataset with us. The Newsela data **may not** be re-distributed outside of Penn. You can find the data on eniac at `/home1/c/ccb/data/newsela/newsela_article_corpus_with_scripts_2016-01-29.1.zip`.
+
+Good luck, and have fun!
+"""
+
+# Optional 4.4: Hugging Face GloVe + BERT count as outside data.
+# Upload test_labels_outside.txt as test_labels.txt on the optional 4.4 board.
+# !pip install gensim transformers torch
 
 import math
 import re
@@ -807,7 +1062,7 @@ def _make_dense(words, sents, counts, wv, complex_c, simple_c):
     return np.vstack(rows)
 
 
-def complex_word_model(train_data, eval_words, ngram_counts, threshold=0.5):
+def outside_data_model(train_data, eval_words, ngram_counts, threshold=0.5):
     """Frozen BERT embeddings + GloVe / morphology / char n-grams."""
     twords, tlabels = train_data
     wv = _glove_model()
@@ -863,68 +1118,33 @@ def complex_word_model(train_data, eval_words, ngram_counts, threshold=0.5):
 
     train_proba = blend(Xtr, Btrs, Xtr_sp)
     eval_proba = blend(Xev, Bevs, Xev_sp)
-    complex_word_model.last_eval_proba = eval_proba
+    outside_data_model.last_eval_proba = eval_proba
     train_pred = (train_proba >= threshold).astype(int).tolist()
     eval_pred = (eval_proba >= threshold).astype(int).tolist()
     return train_pred, eval_pred
 
 
-train_pred, dev_pred = complex_word_model(train_data, dev_data[0], ngram_counts)
+_, outside_dev = outside_data_model(train_data, dev_data[0], ngram_counts, threshold=0.5)
 print(
-    "dev P/R/F1",
-    get_precision(dev_data[1], dev_pred),
-    get_recall(dev_data[1], dev_pred),
-    get_fscore(dev_data[1], dev_pred),
+    "4.4 outside-data dev P/R/F1",
+    get_precision(dev_data[1], outside_dev),
+    get_recall(dev_data[1], outside_dev),
+    get_fscore(dev_data[1], outside_dev),
 )
-
-"""## 4.2 Analyze your model
-
-
-Describe the model and features you choose, and perform a detailed error analysis of your models. Give several examples of words on which your best model performs well. Also give examples of words which your best model performs poorly on, and identify at least TWO categories of words on which your model is making errors.
-
-- **Answer 4.2**: Write a detailed description of your model and features used. Also include error analysis of your model.
-
-**Models tried.** Besides the required Gaussian Naive Bayes and Logistic Regression, I tried Random Forests, Extra Trees, Linear SVM, character TF-IDF logistic regression, Histogram Gradient Boosting, and frozen BERT-base embeddings. The best development result is a probability blend of two HGB models on GloVe/morphology features, one HGB on BERT embeddings, and two logistic models (character n-grams and BERT). Weights 0.35 / 0.25 / 0.15 / 0.15 / 0.10 and threshold 0.5 were chosen on development F1 (**F1 = 0.852**).
-
-**Features (beyond length and frequency).** 50-d GloVe of the target word and of the sentence, cosine to the mean GloVe vectors of complex vs. simple training words, log Google n-gram count, syllable count, WordNet synset/lemma counts, morphology (prefixes, suffixes, rare digraphs, consonant runs), sentence context, character n-grams, and a 1536-d frozen BERT vector (CLS plus mean pooling of the word paired with the sentence, with the target marked).
-
-**What the model gets right.** Long, morphologically marked, lower-frequency words, e.g. `renewable`, `conventional`, `ideology`, `plummeted`, `inaccurate`, `directive`.
-
-**Errors.**
-1. **Short or slangy words that are still conceptually hard** (false negatives): `coup`, `wink`, `kinky`, `yips`, `oath`, `felon`.
-2. **Familiar news/domain words that look morphologically complex** (false positives): `firefighters`, `elementary`, `businesses`, `continues`, `condition`, `cheeseburgers`.
-3. **Hyphenated / numeric compounds** (`best-selling`, `15-nation`, `thumbs-up`) are mixed.
-"""
-
-
-
-"""## 4.3 Leaderboard
-Finally, use your classifier to predict labels for the test data, and submit these labels in a text file named `test_labels.txt` (with one label per line) to the leaderboard; be sure NOT to shuffle the order of the test examples. Instructions for how to post to the leaderboard will be posted on Ed soon.
-**In addition, the top 3 teams will receive 5 bonus points!**
-"""
-
-# Retrain on train+dev for the leaderboard (allowed: provided labeled data only).
 combined_words = train_data[0] + dev_data[0]
 combined_labels = train_data[1] + dev_data[1]
-train_pred, test_pred = complex_word_model(
+_, outside_pred = outside_data_model(
     (combined_words, combined_labels), test_words, ngram_counts, threshold=0.5
 )
-with open("test_labels.txt", "w") as f:
-    f.write("\n".join(map(str, test_pred)) + "\n")
-print("wrote", len(test_pred), "labels, complex rate", sum(test_pred) / len(test_pred))
-
-"""- **Answer 4.3**: Upload your `test_labels.txt` to the leaderboard in Gradescope.
-
-## 4.4. (Optional) Leaderboard using outside data
-
-While the training data we have provided is sufficient for completing this assignment, it is not the only data for the task of identifying complex words. As an optional addition to this homework, you may look for and use any additional training data, and submit your predicted labels in a text file named `test_labels.txt` to the leaderboard.
-
-As a start, we recommend looking at the [SemEval 2016 dataset](http://alt.qcri.org/semeval2016/task11/), a dataset that was used in a complex words identification competition. In addition, you can try to use data from [Newsela](https://newsela.com/). Newsela’s editors re-write newspaper articles to be appropriate for students at different grade levels. The company has generously shared a dataset with us. The Newsela data **may not** be re-distributed outside of Penn. You can find the data on eniac at `/home1/c/ccb/data/newsela/newsela_article_corpus_with_scripts_2016-01-29.1.zip`.
-
-Good luck, and have fun!
-"""
+with open("test_labels_outside.txt", "w") as f:
+    f.write("\n".join(map(str, outside_pred)) + "\n")
+print("wrote", len(outside_pred), "outside-data labels, complex rate", sum(outside_pred) / len(outside_pred))
+print("Upload test_labels_outside.txt as test_labels.txt to the optional 4.4 assignment.")
 
 
+# 4.4 submission reminder:
+# test_labels.txt          -> required 4.3 leaderboard (provided data only)
+# test_labels_outside.txt  -> optional 4.4 leaderboard (GloVe + BERT)
 
 
 """# Submission

@@ -1,0 +1,7 @@
+numpy>=1.23
+scikit-learn>=1.3
+joblib>=1.3
+
+# Optional: richer lexical features (WordNet + syllable estimation)
+# nltk>=3.8
+# syllables>=1.0

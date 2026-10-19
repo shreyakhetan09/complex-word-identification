@@ -1,0 +1,41 @@
+word	label	n_annotators	sentence
+cat	0	10	The cat sat quietly on the warm mat .
+house	0	10	They bought a small house near the river .
+water	0	10	She poured a glass of cold water .
+happy	0	10	The children were happy to see the snow .
+school	0	10	He walks to school every single morning .
+friend	0	10	My friend lives just across the street .
+garden	0	10	We planted tomatoes in the back garden .
+morning	0	10	The morning light came through the window .
+little	0	10	A little dog followed us down the lane .
+bright	0	10	The kitchen was bright and very clean .
+abdicate	1	10	The weary king chose to abdicate the throne .
+ubiquitous	1	10	Smartphones have become ubiquitous in modern life .
+ephemeral	1	10	The beauty of the sunset felt ephemeral .
+cacophony	1	10	A cacophony of car horns filled the street .
+obfuscate	1	10	The report seemed to obfuscate the real numbers .
+quintessential	1	10	He is the quintessential small town doctor .
+surreptitious	1	10	She took a surreptitious glance at the exam .
+perfunctory	1	10	The clerk gave a perfunctory nod and left .
+multifaceted	1	10	The problem is multifaceted and hard to solve .
+incomprehensible	1	10	The instructions were nearly incomprehensible .
+simple	0	10	The recipe is simple and quick to make .
+window	0	10	Rain tapped softly against the window .
+mother	0	10	His mother packed a lunch for the trip .
+yellow	0	10	The old taxi was painted bright yellow .
+table	0	10	They cleared the dishes off the table .
+renewable	1	10	The town now runs on renewable energy .
+conventional	1	10	This differs from the conventional approach .
+plummeted	1	10	Stock prices plummeted after the news .
+ideology	1	10	The party was built around a rigid ideology .
+directive	1	10	Staff received a new directive from the board .
+river	0	10	The river was calm under the bridge .
+coffee	0	10	She drank her coffee before the meeting .
+pencil	0	10	He sharpened a pencil for the exam .
+market	0	10	Fresh fruit filled the busy market stalls .
+winter	0	10	The winter wind was sharp and cold .
+anomaly	1	10	The sensor reading was a clear anomaly .
+paradigm	1	10	The discovery forced a new paradigm .
+scrutinize	1	10	Auditors will scrutinize every transaction .
+inadvertent	1	10	An inadvertent error delayed the launch .
+juxtaposition	1	10	The photo plays on the juxtaposition of old and new .
